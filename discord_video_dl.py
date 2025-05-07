@@ -107,3 +107,4 @@ async def download(url: str):
 # -----------------------------------------------------------
 if __name__ == "__main__":
     bot.run(TOKEN)
+
