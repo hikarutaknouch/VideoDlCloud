@@ -11,7 +11,7 @@ DROPBOX_TOKEN = os.environ["DROPBOX_TOKEN"]
 YTDL = shutil.which("yt-dlp") or "/usr/local/bin/yt-dlp"
 URL_RE = re.compile(r"https?://(?:www\.)?(?:instagram\.com|x\.com|twitter\.com|tiktok\.com|youtu\.be|youtube\.com)/\S+", re.I)
 
-COOKIE_PATHS = { … }               # 省略（そのまま）
+# cookie_for() と COOKIE_PATHS は省略（そのまま）
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -27,9 +27,10 @@ async def on_message(msg):
 
 async def download(url: str):
     print(f"▶ START : {url}")
-    tmpdir = tempfile.mkdtemp()
+    tmpdir = tempfile.mkdtemp()            # ← ここを追加
     try:
         out_tpl = os.path.join(tmpdir, "%(uploader)s_%(id)s.%(ext)s")
+
         cmd = [YTDL, "-S", "vcodec:h264,acodec:m4a,ext:mp4  vp9/?av01/?*",
                "--merge-output-format", "mp4", "-o", out_tpl, url]
 
