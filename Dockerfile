@@ -1,15 +1,13 @@
 FROM python:3.12-slim
 
-# --- 依存パッケージ ---
+# ---- system deps ----
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ffmpeg  curl ca-certificates tzdata \
+      ffmpeg curl ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/*
 
-# ▶↑ `ca-certificates`  … https で yt-dlp が証明書エラーになるのを防ぐ  
-# ▶↑ `tzdata`           … 日本時間のログがずれないように（サイズ +2 MB 程度）
-
-ENV PYTHONUNBUFFERED=1        # ログがバッファされずリアルタイムに流れる
+# ログをバッファリングさせずに標準出力へ
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 COPY requirements.txt .
