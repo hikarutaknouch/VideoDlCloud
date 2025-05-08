@@ -1,8 +1,9 @@
 # discord_video_dl.py
-import os, re, asyncio, tempfile, shutil, subprocess
+import os, re, asyncio, tempfile, shutil, subprocess, requests
 from pathlib import Path
 import discord
 from discord.ext import commands
+from urllib.parse import urlparse
 
 # --------------------------------------------------
 # 1. 環境変数
@@ -14,9 +15,14 @@ CHANNEL        = int(os.environ["TARGET_CHANNEL_ID"])        # 監視チャン�
 # 2. 外部コマンドと正規表現
 # --------------------------------------------------
 YTDL = shutil.which("yt-dlp") or "/usr/local/bin/yt-dlp"
-# 完全なURLパターンを抽出するように修正
+# 完全なURLパターンを抽出するように修正（画像URLも含む）
 URL_RE = re.compile(
     r"(https?://(?:www\.)?(?:instagram\.com|x\.com|twitter\.com|tiktok\.com|youtu\.be|youtube\.com)/\S+)",
+    re.I)
+
+# 画像URLを判定する正規表現（拡張子ベース）
+IMAGE_RE = re.compile(
+    r"(https?://\S+\.(?:jpg|jpeg|png|gif|webp)(?:\?\S*)?$)", 
     re.I)
 
 # --------------------------------------------------
@@ -59,21 +65,125 @@ async def on_message(msg: discord.Message):
     if msg.author.bot or msg.channel.id != CHANNEL:
         return
     
-    urls = URL_RE.findall(msg.content)
-    if urls:
-        print(f"Found URLs: {urls}")
-        for url in urls:
-            # URLごとに非同期タスクとして処理
-            asyncio.create_task(download_and_reply(url, msg.channel))
+    # まず、メッセージ内のすべてのURLを取得
+    all_urls = re.findall(r'(https?://\S+)', msg.content)
+    
+    if all_urls:
+        print(f"Found URLs: {all_urls}")
+        
+        for url in all_urls:
+            # 画像URLかどうかを判定
+            if is_image_url(url):
+                # 画像URLの場合
+                asyncio.create_task(download_image_and_reply(url, msg.channel))
+            elif URL_RE.match(url):
+                # 動画URLの場合（Instagram, Twitter, TikTok, YouTubeなど）
+                asyncio.create_task(download_and_reply(url, msg.channel))
     
     await bot.process_commands(msg)
 
+def is_image_url(url: str) -> bool:
+    """URLが画像URLかどうかを判定する"""
+    # 拡張子による判定
+    if IMAGE_RE.match(url):
+        return True
+    
+    # Twitterの画像URLは特殊なフォーマットを持つことがある
+    if ('pbs.twimg.com' in url or 'twitter.com' in url or 'x.com' in url) and ('media' in url or 'photo' in url):
+        return True
+        
+    # InstagramやFacebookの画像URLも特殊
+    if ('instagram.com' in url or 'facebook.com' in url) and ('p/' in url or 'photo' in url):
+        # 画像投稿の可能性が高いが、実際には動画かもしれないので
+        # 両方のダウンローダーを試す方がいいかもしれない
+        return False
+    
+    return False
+
 # --------------------------------------------------
-# 6. ダウンロードとDiscordへの返信
+# 6. 画像ダウンロード関数
+# --------------------------------------------------
+async def download_image_and_reply(url: str, channel):
+    """URLから画像をダウンロードし、Discordチャンネルに直接送信する"""
+    print(f"▶ START IMAGE DOWNLOAD : {url}")
+    
+    # 一時ディレクトリを作成
+    tmpdir = tempfile.mkdtemp()
+    
+    try:
+        # URLからファイル名を取得
+        parsed_url = urlparse(url)
+        path = parsed_url.path
+        filename = os.path.basename(path)
+        
+        # ファイル名が不適切な場合はデフォルト名を設定
+        if not filename or '.' not in filename:
+            filename = f"image_{int(asyncio.get_event_loop().time())}.jpg"
+        
+        # ファイルパス
+        file_path = os.path.join(tmpdir, filename)
+        
+        # 画像をダウンロード
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # Cookieが必要なサイトの場合
+        cookies = None
+        ck = cookie_for(url)
+        if ck and ck.is_file():
+            # Cookieファイルを読み込む（単純化のため実装省略）
+            print(f"Using cookie file: {ck}")
+        
+        # リクエスト送信
+        response = requests.get(url, headers=headers, cookies=cookies, stream=True)
+        
+        if response.status_code == 200:
+            # 画像を保存
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=1024):
+                    if chunk:
+                        f.write(chunk)
+            
+            # ファイルサイズを確認
+            file_size = os.path.getsize(file_path)
+            file_size_mb = file_size / (1024 * 1024)
+            print(f"Image downloaded: {filename} ({file_size_mb:.2f} MB)")
+            
+            # Discordのファイルサイズ制限（無料: 8MB）
+            discord_limit = 8 * 1024 * 1024
+            
+            if file_size <= discord_limit:
+                # Discordにファイルを直接送信
+                discord_file = discord.File(file_path)
+                await channel.send(f"✅ 画像ダウンロード完了: {url}", file=discord_file)
+                print(f"✔ Image sent to Discord: {filename}")
+            else:
+                # サイズが大きすぎる場合
+                await channel.send(
+                    f"⚠️ 画像ファイルサイズが大きすぎます ({file_size_mb:.2f}MB)。"
+                    f"Discord の制限は {discord_limit/(1024*1024)}MB です。"
+                )
+        else:
+            # ダウンロード失敗
+            await channel.send(f"❌ 画像ダウンロード失敗: {url} (ステータスコード: {response.status_code})")
+            print(f"✖ IMAGE DOWNLOAD FAILED: {url} (status={response.status_code})")
+    
+    except Exception as e:
+        # エラー処理
+        await channel.send(f"❌ 画像ダウンロード中にエラーが発生しました: {url}")
+        print(f"✖ IMAGE DOWNLOAD ERROR: {url} - {str(e)}")
+    
+    finally:
+        # 一時ディレクトリを削除
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# --------------------------------------------------
+# 7. 動画ダウンロード関数
 # --------------------------------------------------
 async def download_and_reply(url: str, channel):
     """URLから動画をダウンロードし、Discordチャンネルに直接送信する"""
-    print(f"▶ START  : {url}")
+    print(f"▶ START VIDEO DOWNLOAD: {url}")
     tmpdir = tempfile.mkdtemp()
     
     try:
@@ -110,8 +220,31 @@ async def download_and_reply(url: str, channel):
             print(f"Found {len(mp4_files)} MP4 files in {tmpdir}")
             
             if not mp4_files:
+                # MP4が見つからない場合は画像ファイルを確認
+                image_files = list(Path(tmpdir).glob("*.jpg")) + list(Path(tmpdir).glob("*.jpeg")) + list(Path(tmpdir).glob("*.png")) + list(Path(tmpdir).glob("*.gif"))
+                
+                if image_files:
+                    print(f"Found {len(image_files)} image files in {tmpdir}")
+                    for img in image_files:
+                        file_size = img.stat().st_size
+                        file_size_mb = file_size / (1024 * 1024)
+                        
+                        discord_limit = 8 * 1024 * 1024
+                        
+                        if file_size <= discord_limit:
+                            discord_file = discord.File(str(img))
+                            await channel.send(f"✅ 画像ダウンロード完了: {url}", file=discord_file)
+                            print(f"✔ Image sent to Discord: {img.name}")
+                        else:
+                            await channel.send(
+                                f"⚠️ 画像ファイルサイズが大きすぎます ({file_size_mb:.2f}MB)。"
+                                f"Discord の制限は {discord_limit/(1024*1024)}MB です。"
+                            )
+                    return
+                
+                # それでもファイルが見つからない場合
                 await channel.send(f"❌ ダウンロードしたファイルが見つかりません: {url}")
-                print(f"No MP4 files found in {tmpdir}. Directory contents:")
+                print(f"No files found in {tmpdir}. Directory contents:")
                 for f in Path(tmpdir).iterdir():
                     print(f"- {f.name} ({f.stat().st_size} bytes)")
                 return
@@ -139,7 +272,7 @@ async def download_and_reply(url: str, channel):
                     
                     # ファイルサイズを縮小するオプションを提供
                     await channel.send(
-                        "画質を下げて再度ダウンロードするには、`!compress {url}` コマンドを使用してください。"
+                        f"画質を下げて再度ダウンロードするには、`!compress {url}` コマンドを使用してください。"
                     )
             
             print(f"✔ PROCESSED: {url}")
@@ -152,7 +285,7 @@ async def download_and_reply(url: str, channel):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 # --------------------------------------------------
-# 7. 圧縮ダウンロードコマンド
+# 8. 圧縮ダウンロードコマンド
 # --------------------------------------------------
 @bot.command(name="compress")
 async def compress_download(ctx, url: str):
@@ -214,7 +347,19 @@ async def compress_download(ctx, url: str):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 # --------------------------------------------------
-# 8. エントリーポイント
+# 9. 画像ダウンロードコマンド
+# --------------------------------------------------
+@bot.command(name="image")
+async def image_download(ctx, url: str):
+    """画像を明示的にダウンロードするコマンド"""
+    if ctx.channel.id != CHANNEL:
+        return
+    
+    await ctx.send(f"🔄 画像のダウンロード中: {url}")
+    await download_image_and_reply(url, ctx.channel)
+
+# --------------------------------------------------
+# 10. エントリーポイント
 # --------------------------------------------------
 if __name__ == "__main__":
     bot.run(TOKEN)
