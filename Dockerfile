@@ -6,8 +6,14 @@ RUN apt-get update \
       ffmpeg curl ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/*
 
+# yt-dlpを確実にインストール
+RUN pip install --no-cache-dir yt-dlp
+
 # ログをバッファリングさせずに標準出力へ
 ENV PYTHONUNBUFFERED=1
+
+# Cookieファイル用ディレクトリ作成
+RUN mkdir -p /app/cookies
 
 WORKDIR /app
 COPY requirements.txt .

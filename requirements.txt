@@ -1,4 +1,3 @@
-discord.py
-yt-dlp
-dropbox
-aiofiles
+discord.py>=2.0.0
+yt-dlp>=2023.3.4
+aiofiles>=0.8.0
