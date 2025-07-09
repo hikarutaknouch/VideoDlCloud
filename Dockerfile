@@ -18,6 +18,6 @@ RUN mkdir -p /app/cookies
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY discord_video_dl.py .
+COPY discord_video_dl_improved.py .
 
-CMD ["python", "discord_video_dl.py"]
+CMD ["python", "discord_video_dl_improved.py"]
