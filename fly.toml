@@ -20,13 +20,7 @@ primary_region = 'nrt'
   auto_stop_machines = false
   auto_start_machines = true
 
-# ヘルスチェック設定（オプション）
-[checks]
-  [checks.bot_alive]
-    type = "script"
-    script = "python -c 'import requests; exit(0)'"
-    interval = "1m"
-    timeout = "5s"
+# ヘルスチェックはDockerfileのHEALTHCHECKを使用
 
 # 環境変数（secretsで設定するもの以外）
 [env]
