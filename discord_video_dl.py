@@ -1,8 +1,7 @@
-# twitter_thread_downloader.py (Xスレッド対応版)
+# discord_video_dl.py (完全修正版)
 import os, re, asyncio, tempfile, shutil, subprocess, requests, json
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Tuple, Optional
 import discord
 from discord.ext import commands
 from urllib.parse import urlparse
@@ -11,7 +10,7 @@ from googleapiclient.http import MediaFileUpload
 from google.oauth2.service_account import Credentials
 
 # --------------------------------------------------
-# 1. 環境変数（既存）
+# 1. 環境変数
 # --------------------------------------------------
 TOKEN = os.environ["DISCORD_TOKEN"]
 CHANNEL_1 = int(os.environ["TARGET_CHANNEL_ID_1"])
@@ -23,507 +22,535 @@ DISCORD_SIZE_LIMIT = 8 * 1024 * 1024  # 8MB
 YTDL = shutil.which("yt-dlp") or "/usr/local/bin/yt-dlp"
 
 # --------------------------------------------------
-# 2. スレッド検出パターン
+# 2. 外部コマンドと正規表現
 # --------------------------------------------------
-class ThreadDetector:
-    """Xスレッドを検出・解析するクラス"""
-    
-    @staticmethod
-    def is_thread_url(url: str) -> bool:
-        """URLがXスレッドの一部かどうかを判定"""
-        return bool(re.search(r"(x\.com|twitter\.com)/.+/status/\d+", url, re.I))
-    
-    @staticmethod
-    def extract_tweet_id(url: str) -> Optional[str]:
-        """URLからツイートIDを抽出"""
-        match = re.search(r"/status/(\d+)", url)
-        return match.group(1) if match else None
-    
-    @staticmethod
-    def extract_username(url: str) -> Optional[str]:
-        """URLからユーザー名を抽出"""
-        match = re.search(r"/([\w]+)/status/", url)
-        return match.group(1) if match else None
+# 対応プラットフォームのURL正規表現
+PLATFORM_PATTERNS = {
+    'twitter': re.compile(r"(https?://(?:www\.)?(?:x\.com|twitter\.com)/\w+/status/\d+)", re.I),
+    'instagram': re.compile(r"(https?://(?:www\.)?instagram\.com/(?:p|reel)/([^/?]+))", re.I),
+    'tiktok': re.compile(r"(https?://(?:www\.)?tiktok\.com/@[\w.-]+/video/\d+)", re.I),
+    'youtube': re.compile(r"(https?://(?:www\.)?(?:youtube\.com/shorts/|youtu\.be/)[\w-]+)", re.I),
+}
 
-class TwitterAPIClient:
-    """Twitter API v2 クライアント（簡易版）"""
-    
-    def __init__(self, bearer_token: Optional[str] = None):
-        self.bearer_token = bearer_token or os.environ.get("TWITTER_BEARER_TOKEN")
-        self.base_url = "https://api.twitter.com/2"
-    
-    async def get_thread_tweets(self, tweet_id: str, username: str) -> List[Dict]:
-        """
-        スレッドの全ツイートを取得
-        注意: 実際の実装ではTwitter API v2が必要
-        """
-        if not self.bearer_token:
-            print("Twitter Bearer Token が設定されていません。yt-dlpフォールバックを使用")
-            return await self._fallback_thread_detection(tweet_id, username)
-        
-        # TODO: Twitter API v2 実装
-        headers = {
-            "Authorization": f"Bearer {self.bearer_token}",
-            "Content-Type": "application/json"
-        }
-        
-        # 実際のAPI呼び出し実装
-        return await self._fallback_thread_detection(tweet_id, username)
-    
-    async def _fallback_thread_detection(self, tweet_id: str, username: str) -> List[Dict]:
-        """
-        yt-dlpを使用したフォールバック方式でスレッド検出
-        """
-        try:
-            # ユーザーの最近のツイートを取得してスレッドを推測
-            cmd = [
-                YTDL,
-                "--flat-playlist",
-                "--print", "%(id)s %(title)s %(upload_date)s",
-                f"https://x.com/{username}",
-                "--max-downloads", "20"  # 最新20件をチェック
-            ]
-            
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await proc.communicate()
-            
-            if proc.returncode == 0:
-                # 時系列でスレッドを推測
-                tweets = []
-                lines = stdout.decode().strip().split('\n')
-                
-                for line in lines:
-                    if line.strip():
-                        parts = line.split(' ', 2)
-                        if len(parts) >= 2:
-                            tweet_data = {
-                                'id': parts[0],
-                                'url': f"https://x.com/{username}/status/{parts[0]}",
-                                'title': parts[2] if len(parts) > 2 else "",
-                                'has_media': True  # 推測
-                            }
-                            tweets.append(tweet_data)
-                
-                # 元のツイートの前後を含むスレッドを推測
-                target_index = None
-                for i, tweet in enumerate(tweets):
-                    if tweet['id'] == tweet_id:
-                        target_index = i
-                        break
-                
-                if target_index is not None:
-                    # 前後のツイートを含めてスレッドとして扱う
-                    start_idx = max(0, target_index - 5)
-                    end_idx = min(len(tweets), target_index + 6)
-                    return tweets[start_idx:end_idx]
-            
-            return [{'id': tweet_id, 'url': f"https://x.com/{username}/status/{tweet_id}"}]
-            
-        except Exception as e:
-            print(f"フォールバックスレッド検出エラー: {e}")
-            return [{'id': tweet_id, 'url': f"https://x.com/{username}/status/{tweet_id}"}]
+# 画像URLを判定する正規表現
+IMAGE_RE = re.compile(
+    r"(https?://\S+\.(?:jpg|jpeg|png|gif|webp)(?:\?\S*)?$)", 
+    re.I
+)
 
 # --------------------------------------------------
-# 3. スレッドダウンロードマネージャー
+# 3. Google Drive 設定
 # --------------------------------------------------
-class ThreadDownloadManager:
-    """スレッド全体のダウンロードを管理"""
-    
-    def __init__(self, bot):
-        self.bot = bot
-        self.twitter_client = TwitterAPIClient()
-    
-    async def download_thread_media(self, url: str, channel, progress_callback=None) -> Dict:
-        """
-        スレッド全体のメディアをダウンロード
-        Returns: {
-            'total_tweets': int,
-            'successful_downloads': int,
-            'failed_downloads': int,
-            'media_files': List[str],
-            'drive_links': List[str]
-        }
-        """
-        detector = ThreadDetector()
-        tweet_id = detector.extract_tweet_id(url)
-        username = detector.extract_username(url)
-        
-        if not tweet_id or not username:
-            raise ValueError("無効なX/TwitterのURLです")
-        
-        # 進捗報告
-        if progress_callback:
-            await progress_callback("🔍 スレッドを解析中...")
-        
-        # スレッドのツイート一覧を取得
-        thread_tweets = await self.twitter_client.get_thread_tweets(tweet_id, username)
-        
-        if progress_callback:
-            await progress_callback(f"📝 スレッド検出: {len(thread_tweets)}件のツイート")
-        
-        # 結果格納
-        results = {
-            'total_tweets': len(thread_tweets),
-            'successful_downloads': 0,
-            'failed_downloads': 0,
-            'media_files': [],
-            'drive_links': [],
-            'discord_files': []
-        }
-        
-        # 各ツイートからメディアをダウンロード
-        for i, tweet in enumerate(thread_tweets):
-            if progress_callback:
-                await progress_callback(f"⬇️ ダウンロード中: {i+1}/{len(thread_tweets)}")
-            
-            try:
-                media_result = await self._download_tweet_media(tweet['url'], f"thread_{i+1:02d}")
-                if media_result:
-                    results['successful_downloads'] += 1
-                    results['media_files'].extend(media_result.get('files', []))
-                    if media_result.get('drive_link'):
-                        results['drive_links'].append(media_result['drive_link'])
-                    if media_result.get('discord_file'):
-                        results['discord_files'].append(media_result['discord_file'])
-                else:
-                    results['failed_downloads'] += 1
-                    
-            except Exception as e:
-                print(f"ツイート {tweet['url']} のダウンロードエラー: {e}")
-                results['failed_downloads'] += 1
-                
-            # 過負荷防止のための待機
-            await asyncio.sleep(1)
-        
-        return results
-    
-    async def _download_tweet_media(self, tweet_url: str, prefix: str) -> Optional[Dict]:
-        """
-        個別ツイートのメディアをダウンロード
-        """
-        tmpdir = tempfile.mkdtemp()
-        
-        try:
-            out_tpl = os.path.join(tmpdir, f"{prefix}_%(id)s.%(ext)s")
-            
-            cmd = [
-                YTDL,
-                "-f", "best[ext=mp4]/best",
-                "--write-thumbnail", "--write-info-json",
-                "-o", out_tpl,
-                tweet_url,
-            ]
-            
-            # Cookie設定
-            cookie_path = Path("/app/cookies/twitter_cookies.txt")
-            if cookie_path.exists():
-                cmd.extend(["--cookies", str(cookie_path)])
-            
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await proc.communicate()
-            
-            if proc.returncode == 0:
-                # ダウンロードされたファイルを探す
-                downloaded_files = list(Path(tmpdir).glob("*"))
-                media_files = [f for f in downloaded_files if f.suffix in ['.mp4', '.jpg', '.png', '.gif', '.webp']]
-                
-                if media_files:
-                    # 最初のメディアファイルを処理
-                    media_file = media_files[0]
-                    file_size = media_file.stat().st_size
-                    
-                    result = {
-                        'files': [str(media_file)],
-                        'file_size': file_size
-                    }
-                    
-                    # Google Driveアップロード
-                    if self.bot.drive_service:
-                        try:
-                            file_id, drive_link = await self.bot.upload_to_drive(
-                                str(media_file), media_file.name, "twitter_thread"
-                            )
-                            result['drive_link'] = drive_link
-                            result['file_id'] = file_id
-                        except Exception as e:
-                            print(f"Drive upload error: {e}")
-                    
-                    # Discordファイル準備
-                    if file_size <= DISCORD_SIZE_LIMIT:
-                        result['discord_file'] = discord.File(str(media_file), filename=media_file.name)
-                    
-                    return result
-            
-            return None
-            
-        except Exception as e:
-            print(f"Individual tweet download error: {e}")
-            return None
-        
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-# --------------------------------------------------
-# 4. Bot拡張 - スレッドコマンド
-# --------------------------------------------------
-class ThreadDownloadBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(command_prefix="!", intents=intents)
-        
-        self.thread_manager = ThreadDownloadManager(self)
-        # 既存のGoogle Drive設定
-        self.drive_service = self.setup_google_drive()
-        self.monitored_channels = [CHANNEL_1, CHANNEL_2]
-    
-    def setup_google_drive(self):
-        """既存のGoogle Drive設定"""
-        if not GOOGLE_SERVICE_ACCOUNT_JSON:
-            return None
-        try:
-            service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-            credentials = Credentials.from_service_account_info(
-                service_account_info,
-                scopes=['https://www.googleapis.com/auth/drive']
-            )
-            service = build('drive', 'v3', credentials=credentials)
-            return service
-        except Exception as e:
-            print(f"Google Drive API初期化エラー: {e}")
-            return None
-    
-    async def upload_to_drive(self, file_path: str, filename: str, platform: str) -> tuple[str, str]:
-        """既存のGoogle Driveアップロード機能"""
-        # 既存実装を使用
-        pass
-
-# --------------------------------------------------
-# 5. スレッドダウンロードコマンド
-# --------------------------------------------------
-@bot.command(name="thread")
-async def download_thread(ctx, url: str = None):
-    """
-    Xスレッド全体をダウンロード
-    使用例: !thread https://x.com/username/status/1234567890
-    """
-    if ctx.channel.id not in bot.monitored_channels:
-        return
-    
-    if not url:
-        embed = discord.Embed(
-            title="❌ URL が必要です",
-            description="使用例: `!thread https://x.com/username/status/1234567890`",
-            color=0xff0000
-        )
-        await ctx.send(embed=embed)
-        return
-    
-    # URL検証
-    detector = ThreadDetector()
-    if not detector.is_thread_url(url):
-        await ctx.send("❌ 有効なX/TwitterのURLを指定してください")
-        return
-    
-    # 進捗メッセージ
-    progress_embed = discord.Embed(
-        title="🧵 スレッドダウンロード開始",
-        description="スレッドを解析中...",
-        color=0x1DA1F2
-    )
-    progress_msg = await ctx.send(embed=progress_embed)
-    
-    async def update_progress(status: str):
-        """進捗更新用コールバック"""
-        progress_embed.description = status
-        await progress_msg.edit(embed=progress_embed)
+def setup_google_drive():
+    """Google Drive APIクライアントを設定"""
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        print("Google Drive サービスアカウントJSONが設定されていません")
+        return None
     
     try:
-        # スレッドダウンロード実行
-        results = await bot.thread_manager.download_thread_media(url, ctx.channel, update_progress)
+        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        credentials = Credentials.from_service_account_info(
+            service_account_info,
+            scopes=['https://www.googleapis.com/auth/drive']
+        )
+        service = build('drive', 'v3', credentials=credentials)
+        print("Google Drive API初期化完了")
+        return service
+    except Exception as e:
+        print(f"Google Drive API初期化エラー: {e}")
+        return None
+
+# Google Drive サービス初期化
+drive_service = setup_google_drive()
+
+# --------------------------------------------------
+# 4. Cookie ファイルパス
+# --------------------------------------------------
+COOKIE_DIR = "/app/cookies"
+Path(COOKIE_DIR).mkdir(exist_ok=True)
+
+COOKIE_PATHS = {
+    "instagram": Path(COOKIE_DIR) / "instagram_cookies.txt",
+    "twitter": Path(COOKIE_DIR) / "twitter_cookies.txt",
+    "tiktok": Path(COOKIE_DIR) / "tiktok_cookies.txt",
+    "youtube": Path(COOKIE_DIR) / "youtube_cookies.txt",
+}
+
+def cookie_for(url: str) -> Path | None:
+    """URLからクッキーファイルのパスを取得"""
+    if "instagram.com" in url:
+        return COOKIE_PATHS["instagram"]
+    if "twitter.com" in url or "x.com" in url:
+        return COOKIE_PATHS["twitter"]
+    if "tiktok.com" in url:
+        return COOKIE_PATHS["tiktok"]
+    if "youtube.com" in url or "youtu.be" in url:
+        return COOKIE_PATHS["youtube"]
+    return None
+
+def detect_platform(url: str) -> str:
+    """URLからプラットフォームを検出"""
+    for platform, pattern in PLATFORM_PATTERNS.items():
+        if pattern.search(url):
+            return platform
+    return "unknown"
+
+# --------------------------------------------------
+# 5. Google Drive アップロード関数
+# --------------------------------------------------
+async def upload_to_drive(file_path: str, filename: str, platform: str):
+    """
+    ファイルをGoogle Driveにアップロードして共有リンクを返す
+    Returns: (file_id, shareable_link)
+    """
+    if not drive_service:
+        raise Exception("Google Drive APIが初期化されていません")
+    
+    try:
+        # ファイル名にプラットフォームと日時を追加
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        drive_filename = f"[{platform.upper()}]_{timestamp}_{filename}"
         
-        # 結果表示
-        await display_thread_results(ctx, results, url, progress_msg)
+        # ファイルメタデータ（共有ドライブ対応）
+        file_metadata = {
+            'name': drive_filename,
+        }
+        
+        # 共有ドライブかどうかを判定
+        if GOOGLE_DRIVE_FOLDER_ID.startswith('0'):
+            file_metadata['parents'] = [GOOGLE_DRIVE_FOLDER_ID]
+        else:
+            file_metadata['parents'] = [GOOGLE_DRIVE_FOLDER_ID] if GOOGLE_DRIVE_FOLDER_ID else []
+        
+        # ファイルをアップロード
+        media = MediaFileUpload(file_path, resumable=True)
+        file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id',
+            supportsAllDrives=True
+        ).execute()
+        
+        file_id = file.get('id')
+        
+        # ファイルを誰でもアクセス可能に設定
+        drive_service.permissions().create(
+            fileId=file_id,
+            body={
+                'role': 'reader',
+                'type': 'anyone'
+            },
+            supportsAllDrives=True
+        ).execute()
+        
+        # 共有可能なリンクを生成
+        shareable_link = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
+        
+        print(f"Google Driveにアップロード完了: {drive_filename}")
+        return file_id, shareable_link
         
     except Exception as e:
-        error_embed = discord.Embed(
-            title="❌ スレッドダウンロードエラー",
-            description=f"エラー: {str(e)}",
-            color=0xff0000
-        )
-        await progress_msg.edit(embed=error_embed)
-
-async def display_thread_results(ctx, results: Dict, original_url: str, progress_msg):
-    """スレッドダウンロード結果を表示"""
-    
-    # 成功・失敗の集計
-    total = results['total_tweets']
-    success = results['successful_downloads']
-    failed = results['failed_downloads']
-    
-    # メイン結果埋め込み
-    result_embed = discord.Embed(
-        title="🧵 スレッドダウンロード完了",
-        description=f"**元URL:** {original_url}",
-        color=0x00ff00 if success > 0 else 0xff9900
-    )
-    
-    result_embed.add_field(
-        name="📊 ダウンロード結果",
-        value=f"成功: {success}件\n失敗: {failed}件\n合計: {total}件",
-        inline=True
-    )
-    
-    # Discordファイル添付（制限内のもの）
-    discord_files = results.get('discord_files', [])[:10]  # 最大10ファイル
-    
-    if discord_files:
-        result_embed.add_field(
-            name="📱 Discord添付",
-            value=f"{len(discord_files)}件のファイルを添付",
-            inline=True
-        )
-    
-    # Google Driveリンク
-    drive_links = results.get('drive_links', [])
-    if drive_links:
-        result_embed.add_field(
-            name="☁️ Google Drive",
-            value=f"[フォルダを開く](https://drive.google.com/drive/folders/{GOOGLE_DRIVE_FOLDER_ID})",
-            inline=True
-        )
-        
-        # 個別リンクは別メッセージで
-        if len(drive_links) <= 5:
-            links_text = "\n".join([f"[ファイル {i+1}]({link})" for i, link in enumerate(drive_links)])
-            result_embed.add_field(
-                name="🔗 個別リンク",
-                value=links_text,
-                inline=False
-            )
-    
-    result_embed.set_footer(text=f"スレッド一括ダウンロード | 処理時間: {total * 1.5:.1f}秒")
-    
-    # メッセージ更新
-    await progress_msg.edit(embed=result_embed)
-    
-    # Discordファイル送信（制限があるため分割）
-    if discord_files:
-        try:
-            await ctx.send("📱 **Discord添付ファイル:**", files=discord_files[:10])
-        except discord.HTTPException as e:
-            await ctx.send(f"⚠️ 一部ファイルの添付に失敗しました: {str(e)}")
+        print(f"Google Driveアップロードエラー: {e}")
+        raise
 
 # --------------------------------------------------
-# 6. 自動スレッド検出
+# 6. ハイブリッド送信関数
+# --------------------------------------------------
+async def send_hybrid_result(channel, file_path: str, filename: str, platform: str, url: str, file_size: int):
+    """
+    ファイルサイズに応じてDiscord直接送信 + Google Drive保存を行う
+    """
+    file_size_mb = file_size / (1024 * 1024)
+    
+    # 結果格納用
+    discord_file_sent = False
+    drive_url = None
+    file_id = None
+    
+    try:
+        # 1. Google Driveに必ずアップロード
+        if drive_service:
+            try:
+                file_id, drive_url = await upload_to_drive(file_path, filename, platform)
+                print(f"✅ Google Drive アップロード成功: {filename}")
+            except Exception as e:
+                print(f"⚠️ Google Drive アップロード失敗: {e}")
+        
+        # 2. Discord送信可能サイズかチェック
+        discord_file = None
+        if file_size <= DISCORD_SIZE_LIMIT:
+            try:
+                discord_file = discord.File(file_path, filename=filename)
+                print(f"✅ Discordファイル準備完了: {filename} ({file_size_mb:.2f}MB)")
+                discord_file_sent = True
+            except Exception as e:
+                print(f"⚠️ Discordファイル準備失敗: {e}")
+                discord_file_sent = False
+        
+        # 3. 結果に応じたメッセージ作成
+        if discord_file_sent and drive_url:
+            # 両方成功：最高のユーザー体験
+            embed = discord.Embed(
+                title=f"✅ {platform.upper()} ダウンロード完了",
+                description=f"**元URL:** {url}\n**ファイルサイズ:** {file_size_mb:.2f} MB",
+                color=0x00ff00
+            )
+            embed.add_field(
+                name="📱 Discordで直接再生", 
+                value="⬇️ 添付ファイルをご確認ください", 
+                inline=False
+            )
+            embed.add_field(
+                name="☁️ Google Drive保存", 
+                value=f"[ファイルを開く]({drive_url})", 
+                inline=False
+            )
+            embed.add_field(
+                name="🔗 直接ダウンロード", 
+                value=f"[ダウンロード](https://drive.google.com/uc?id={file_id})", 
+                inline=False
+            )
+            embed.set_footer(text=f"プラットフォーム: {platform.upper()} | 両方の保存場所で利用可能")
+            
+            await channel.send(embed=embed, file=discord_file)
+            
+        elif discord_file_sent and not drive_url:
+            # Discord送信のみ成功
+            embed = discord.Embed(
+                title=f"✅ {platform.upper()} ダウンロード完了",
+                description=f"**元URL:** {url}\n**ファイルサイズ:** {file_size_mb:.2f} MB",
+                color=0x00ff00
+            )
+            embed.add_field(
+                name="📱 Discordで直接再生", 
+                value="⬇️ 添付ファイルをご確認ください", 
+                inline=False
+            )
+            embed.add_field(
+                name="⚠️ Google Drive", 
+                value="アップロードに失敗しました", 
+                inline=False
+            )
+            embed.set_footer(text=f"プラットフォーム: {platform.upper()}")
+            
+            await channel.send(embed=embed, file=discord_file)
+            
+        elif not discord_file_sent and drive_url:
+            # Google Driveのみ成功（ファイルサイズが大きい場合）
+            embed = discord.Embed(
+                title=f"✅ {platform.upper()} ダウンロード完了",
+                description=f"**元URL:** {url}\n**ファイルサイズ:** {file_size_mb:.2f} MB",
+                color=0x00ff00
+            )
+            embed.add_field(
+                name="📁 ファイルサイズについて", 
+                value=f"ファイルサイズが{DISCORD_SIZE_LIMIT/(1024*1024):.0f}MBを超えているため、Google Driveに保存しました", 
+                inline=False
+            )
+            embed.add_field(
+                name="☁️ Google Drive保存", 
+                value=f"[ファイルを開く]({drive_url})", 
+                inline=False
+            )
+            embed.add_field(
+                name="🔗 直接ダウンロード", 
+                value=f"[ダウンロード](https://drive.google.com/uc?id={file_id})", 
+                inline=False
+            )
+            embed.set_footer(text=f"プラットフォーム: {platform.upper()} | Google Driveでアクセス")
+            
+            await channel.send(embed=embed)
+            
+        else:
+            # 両方失敗
+            embed = discord.Embed(
+                title=f"❌ {platform.upper()} 保存エラー",
+                description=f"**元URL:** {url}\n**ファイルサイズ:** {file_size_mb:.2f} MB",
+                color=0xff0000
+            )
+            embed.add_field(
+                name="エラー内容", 
+                value="DiscordとGoogle Drive両方への保存に失敗しました", 
+                inline=False
+            )
+            embed.set_footer(text="しばらく時間をおいて再試行してください")
+            
+            await channel.send(embed=embed)
+        
+        print(f"✅ ハイブリッド送信完了: Discord={discord_file_sent}, Drive={bool(drive_url)}")
+        
+    except Exception as e:
+        # 全体的なエラーハンドリング
+        await channel.send(f"❌ ファイル送信中にエラーが発生しました: {url}\nエラー: {str(e)}")
+        print(f"✖ HYBRID SEND ERROR: {url} - {str(e)}")
+
+# --------------------------------------------------
+# 7. Discord Bot 初期化
+# --------------------------------------------------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# 監視対象チャンネルのリスト
+MONITORED_CHANNELS = [CHANNEL_1, CHANNEL_2]
+
+# --------------------------------------------------
+# 8. メッセージ受信ハンドラ
 # --------------------------------------------------
 @bot.event
-async def on_message(message: discord.Message):
-    """メッセージ受信時の自動処理"""
-    if message.author.bot or message.channel.id not in bot.monitored_channels:
+async def on_message(msg: discord.Message):
+    if msg.author.bot or msg.channel.id not in MONITORED_CHANNELS:
         return
     
-    # URL検出
-    urls = re.findall(r'(https?://\S+)', message.content)
-    if not urls:
-        await bot.process_commands(message)
-        return
+    # メッセージ内のすべてのURLを取得
+    all_urls = re.findall(r'(https?://\S+)', msg.content)
     
-    for url in urls:
-        detector = ThreadDetector()
+    if all_urls:
+        print(f"Found URLs: {all_urls}")
         
-        if detector.is_thread_url(url):
-            # スレッド検出時の処理選択
+        for url in all_urls:
+            platform = detect_platform(url)
+            print(f"Platform detected: {platform} for URL: {url}")
             
-            # オプション1: 自動的にスレッド全体をダウンロード
-            # asyncio.create_task(auto_download_thread(url, message.channel))
-            
-            # オプション2: ユーザーに選択肢を提示
-            embed = discord.Embed(
-                title="🧵 スレッド検出",
-                description="Xスレッドが検出されました。ダウンロード方法を選択してください:",
-                color=0x1DA1F2
-            )
-            embed.add_field(
-                name="1️⃣ 単一ツイートのみ", 
-                value="このツイートのみダウンロード",
-                inline=False
-            )
-            embed.add_field(
-                name="2️⃣ スレッド全体", 
-                value="`!thread <URL>` でスレッド全体をダウンロード",
-                inline=False
-            )
-            
-            await message.channel.send(embed=embed)
-            
-            # 通常の単一ダウンロードも実行
-            asyncio.create_task(download_single_tweet(url, message.channel))
+            # 対応プラットフォームの場合はメディアダウンロード
+            if platform != "unknown":
+                asyncio.create_task(download_and_hybrid_upload(url, msg.channel, platform))
+            # 画像URLの場合は画像ダウンロード
+            elif is_image_url(url):
+                asyncio.create_task(download_and_hybrid_upload_image(url, msg.channel))
     
-    await bot.process_commands(message)
+    await bot.process_commands(msg)
 
-async def download_single_tweet(url: str, channel):
-    """既存の単一ツイートダウンロード機能"""
-    # 既存のダウンロード処理を使用
-    pass
+def is_image_url(url: str) -> bool:
+    """URLが画像URLかどうかを判定する"""
+    if IMAGE_RE.match(url):
+        return True
+    if ('pbs.twimg.com' in url) and ('media' in url):
+        return True
+    return False
 
 # --------------------------------------------------
-# 7. 統計・ヘルプコマンド
+# 9. 画像ダウンロード関数
 # --------------------------------------------------
-@bot.command(name="thread_help")
-async def thread_help(ctx):
-    """スレッドダウンロード機能のヘルプ"""
+async def download_and_hybrid_upload_image(url: str, channel):
+    """URLから画像をダウンロードし、ハイブリッド送信"""
+    print(f"▶ START IMAGE HYBRID DOWNLOAD: {url}")
+    
+    tmpdir = tempfile.mkdtemp()
+    
+    try:
+        # URLからファイル名を取得
+        parsed_url = urlparse(url)
+        path = parsed_url.path
+        filename = os.path.basename(path)
+        
+        if not filename or '.' not in filename:
+            filename = f"image_{int(asyncio.get_event_loop().time())}.jpg"
+        
+        file_path = os.path.join(tmpdir, filename)
+        
+        # 画像をダウンロード
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+            'Referer': 'https://www.instagram.com/',
+        }
+        
+        response = requests.get(url, headers=headers, stream=True, timeout=30)
+        
+        if response.status_code == 200:
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=1024):
+                    if chunk:
+                        f.write(chunk)
+            
+            file_size = os.path.getsize(file_path)
+            print(f"Image downloaded: {filename} ({file_size / (1024*1024):.2f} MB)")
+            
+            # ハイブリッド送信
+            await send_hybrid_result(channel, file_path, filename, "image", url, file_size)
+            
+        else:
+            await channel.send(f"❌ 画像ダウンロード失敗: {url} (ステータスコード: {response.status_code})")
+    
+    except Exception as e:
+        await channel.send(f"❌ 画像処理中にエラーが発生しました: {url}")
+        print(f"✖ IMAGE DOWNLOAD ERROR: {url} - {str(e)}")
+    
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# --------------------------------------------------
+# 10. メディアダウンロード関数
+# --------------------------------------------------
+async def download_and_hybrid_upload(url: str, channel, platform: str):
+    """URLから動画をダウンロードし、ハイブリッド送信"""
+    print(f"▶ START MEDIA HYBRID DOWNLOAD: {url} (Platform: {platform})")
+    tmpdir = tempfile.mkdtemp()
+    
+    try:
+        out_tpl = os.path.join(tmpdir, "%(uploader)s_%(id)s.%(ext)s")
+
+        # プラットフォーム別のyt-dlpオプション
+        cmd = [YTDL]
+        
+        if platform == "instagram":
+            cmd.extend([
+                "-f", "best[ext=mp4]/best",
+                "--merge-output-format", "mp4",
+                "--write-thumbnail",
+                "-o", out_tpl,
+                url,
+            ])
+        elif platform == "tiktok":
+            cmd.extend([
+                "-f", "best[ext=mp4]/best",
+                "--merge-output-format", "mp4",
+                "-o", out_tpl,
+                url,
+            ])
+        elif platform == "youtube":
+            cmd.extend([
+                "-f", "best[height<=1080][ext=mp4]/best[ext=mp4]/best",
+                "--merge-output-format", "mp4",
+                "-o", out_tpl,
+                url,
+            ])
+        else:  # Twitter/X
+            cmd.extend([
+                "-S", "vcodec:h264,acodec:m4a,ext:mp4",
+                "--merge-output-format", "mp4",
+                "-o", out_tpl,
+                url,
+            ])
+
+        # Cookieファイルがあれば追加
+        ck = cookie_for(url)
+        if ck and ck.is_file():
+            cmd.extend(["--cookies", str(ck)])
+            print(f"Using cookie file: {ck}")
+
+        print(f"Running command: {' '.join(cmd)}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode == 0:
+            # ダウンロード成功 - ファイルを検索
+            media_files = []
+            for ext in ['*.mp4', '*.mov', '*.avi', '*.mkv']:
+                media_files.extend(list(Path(tmpdir).glob(ext)))
+            
+            if not media_files:
+                # 動画がない場合は画像を検索
+                for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
+                    media_files.extend(list(Path(tmpdir).glob(ext)))
+            
+            if media_files:
+                for media_file in media_files[:1]:  # 最初のファイルのみ処理
+                    file_size = media_file.stat().st_size
+                    file_size_mb = file_size / (1024 * 1024)
+                    print(f"Media file found: {media_file.name} ({file_size_mb:.2f} MB)")
+                    
+                    # ハイブリッド送信
+                    await send_hybrid_result(channel, str(media_file), media_file.name, platform, url, file_size)
+                    break
+            else:
+                await channel.send(f"❌ ダウンロードしたファイルが見つかりません: {url}")
+                print(f"No media files found in {tmpdir}")
+        else:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            await channel.send(f"❌ {platform.upper()} ダウンロード失敗: {url}")
+            print(f"✖ DOWNLOAD FAILED: {url} (rc={proc.returncode}) - {error_msg}")
+
+    except Exception as e:
+        await channel.send(f"❌ {platform.upper()} 処理中にエラーが発生しました: {url}")
+        print(f"✖ MEDIA DOWNLOAD ERROR: {url} - {str(e)}")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# --------------------------------------------------
+# 11. 基本コマンド
+# --------------------------------------------------
+@bot.command(name="status")
+async def bot_status(ctx):
+    """Bot の状態を表示"""
+    if ctx.channel.id not in MONITORED_CHANNELS:
+        return
+    
     embed = discord.Embed(
-        title="🧵 スレッドダウンロード機能",
-        description="Xのスレッド（連投）全体を一括ダウンロードします",
-        color=0x1DA1F2
+        title="🤖 Bot ステータス",
+        color=0x0099ff
+    )
+    embed.add_field(name="Google Drive", value="✅ 有効" if drive_service else "❌ 無効", inline=True)
+    embed.add_field(name="ハイブリッド送信", value="✅ 有効", inline=True)
+    embed.add_field(name="ファイルサイズ制限", value=f"{DISCORD_SIZE_LIMIT/(1024*1024):.0f}MB", inline=True)
+    
+    embed.add_field(
+        name="対応プラットフォーム", 
+        value="Twitter/X, Instagram, TikTok, YouTube Shorts", 
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name="help_dl")
+async def help_command(ctx):
+    """ヘルプを表示"""
+    if ctx.channel.id not in MONITORED_CHANNELS:
+        return
+    
+    embed = discord.Embed(
+        title="📥 SNS メディアダウンローダー",
+        description="対応プラットフォーム: **Twitter/X**, **Instagram**, **TikTok**, **YouTube Shorts**",
+        color=0x0099ff
     )
     
     embed.add_field(
-        name="📋 基本コマンド",
-        value="`!thread <URL>` - スレッド全体をダウンロード",
+        name="🔄 自動ダウンロード",
+        value="チャンネルにリンクを貼るだけで自動的にダウンロード",
         inline=False
     )
     
     embed.add_field(
-        name="🎯 対応形式",
-        value="• 画像（JPEG, PNG, GIF, WebP）\n• 動画（MP4, MOV）\n• スレッド内の全メディア",
+        name="💾 保存先",
+        value="• Discord添付（8MB以下）\n• Google Drive（全ファイル）",
         inline=False
     )
     
     embed.add_field(
-        name="💾 保存場所",
-        value="• Discord添付（8MB以下）\n• Google Drive（全ファイル）\n• 自動ファイル名付け",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="⚠️ 注意事項",
-        value="• 大きなスレッドは処理に時間がかかります\n• 認証が必要なツイートは対象外\n• API制限により一部取得できない場合があります",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="💡 使用例",
-        value="`!thread https://x.com/username/status/1234567890`",
+        name="📋 コマンド",
+        value="`!status` - Bot状態確認\n`!help_dl` - このヘルプ",
         inline=False
     )
     
     await ctx.send(embed=embed)
 
 # --------------------------------------------------
-# 8. エントリーポイント
+# 12. Bot起動時の処理
 # --------------------------------------------------
-bot = ThreadDownloadBot()
+@bot.event
+async def on_ready():
+    print(f'{bot.user} としてログインしました')
+    print(f'監視チャンネル: {MONITORED_CHANNELS}')
+    print(f'Google Drive設定: {"有効" if drive_service else "無効"}')
+    print(f'Discordファイルサイズ制限: {DISCORD_SIZE_LIMIT/(1024*1024):.0f}MB')
+    
+    # チャンネル存在確認
+    for channel_id in MONITORED_CHANNELS:
+        channel = bot.get_channel(channel_id)
+        if channel:
+            print(f'チャンネル確認OK: {channel.name} (ID: {channel_id})')
+        else:
+            print(f'⚠️ チャンネルが見つかりません: {channel_id}')
 
+# --------------------------------------------------
+# 13. エントリーポイント
+# --------------------------------------------------
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ DISCORD_TOKEN環境変数が設定されていません")
